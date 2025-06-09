@@ -1,0 +1,14 @@
+
+*.log
+/modified_janus/
+/pruning_configs/
+/quantization_configs/
+/drop_configs/
+/wandb/
+*.pth
+*.txt
+*.out
+/scripts/
+*.jpg
+/store_tokens.pt
+
