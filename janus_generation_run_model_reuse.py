@@ -217,7 +217,7 @@ def main():
     os.makedirs("generated_samples", exist_ok=True)
     for idx, img in enumerate(dec):
         PIL.Image.fromarray(img).save(f"generated_samples/img_{idx}_fy_007.jpg")
-    print("✅ 生成完成，图像已保存在 generated_samples/")
+    print("生成完成，图像已保存在 generated_samples/")
 
 # ------------------------------------------------------------
 if __name__ == "__main__":

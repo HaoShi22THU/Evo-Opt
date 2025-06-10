@@ -645,8 +645,6 @@ def main():
     for line in layer_drop_config:
         print(line)
 
-    ppl_eval = compute_perplexity(model, prompt, eval_datasets)
-    full_train_ppl = compute_perplexity(model, prompt, calibration_data)
 
 if __name__ == "__main__":
     main()

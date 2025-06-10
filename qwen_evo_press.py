@@ -22,6 +22,44 @@ if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
 # 之后再导入 / 加载 Qwen2_5_VLForConditionalGeneration
 from transformers import Qwen2_5_VLForConditionalGeneration
 
+import types
+from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
+
+def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
+    """
+    A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
+    shape‑mismatch error when attention_mask contains vision tokens.
+    """
+    # When no mask is given, fall back to a simple arange.
+    if attention_mask is None:
+        seq_len = input_ids.size(1)
+        position_ids = torch.arange(
+            seq_len, dtype=torch.long, device=input_ids.device
+        ).unsqueeze(0).expand(input_ids.size(0), -1)
+        return position_ids, None
+
+    # Build position_ids sample‑by‑sample.
+    pos_list = []
+    for i in range(input_ids.size(0)):       # iterate over batch
+        text_mask = attention_mask[i] == 1   # keep only text tokens
+        pos = torch.arange(
+            text_mask.sum(),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        pos_list.append(pos)
+
+    # Pad to the longest sequence in the batch.
+    position_ids = torch.nn.utils.rnn.pad_sequence(
+        pos_list, batch_first=True, padding_value=0
+    )
+    return position_ids, None  # rope_deltas is unchanged
+
+# Monkey‑patch the model class
+qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
+    _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
+)
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import  AutoProcessor, AutoConfig
 from qwen_vl_utils import process_vision_info
@@ -54,6 +92,13 @@ import PIL.Image
 def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer):
     device = next(model.parameters()).device
 
+    # model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
+
+    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+
+    # # print(model.model)
+    # processor = AutoProcessor.from_pretrained(model_path)
+
     messages = [
         {
             "role": "user",
@@ -70,6 +115,7 @@ def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prom
     text = processor.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
     )
+    
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -84,7 +130,7 @@ def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prom
     generated_ids = model.generate(
         **inputs,
         max_new_tokens=128,
-        use_cache=False
+        use_cache=True
     )
 
     generated_ids_trimmed = [
@@ -94,7 +140,7 @@ def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prom
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
 
-    from collections import OrderedDict
+    
 
     def safe_tokenize(texts, max_length=76):
         flat = []
@@ -196,9 +242,9 @@ def load_states(model, layers, removed_state, drop_two_consecutive):
         for j in range(len(removed_state[subblock_type])):
             # 根据subblock_type获取对应的subblock
             if subblock_type == "attn":
-                subblock = getattr(layers[j], get_attn_layer_name(model))
+                subblock = getattr(layers[j], get_attn_layer_name(model.model))
             else:
-                subblock = getattr(layers[j], get_mlp_layer_name(model))
+                subblock = getattr(layers[j], get_mlp_layer_name(model.model))
             # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
             if removed_state[subblock_type][j]:
                 make_dummy_forward(subblock, subblock_type)
@@ -289,7 +335,7 @@ def parse_args():
     parser.add_argument("--eval_tokens", default=524288, type=int, help="Number of tokens for evaluation.")
     parser.add_argument("--eval_sequence_length", default=None, type=int, help="Length of evaluation sequences.")
     # Sparsification params
-    parser.add_argument("--sparsity", type=float, default=0.40, help="Fraction of layers to drop.")
+    parser.add_argument("--sparsity", type=float, default=0.20, help="Fraction of layers to drop.")
     # Logging params
     parser.add_argument("--log_wandb", default=False, action="store_true", help="Whether to log to W&B")
     # Evolutionary Search paramsss
@@ -414,16 +460,6 @@ def main():
     )
     inputs = inputs.to("cuda")
 
-    print("input_ids shape:", inputs["input_ids"].shape)
-    print("attention_mask shape:", inputs["attention_mask"].shape)
-
-
-    if inputs["input_ids"].shape != inputs["attention_mask"].shape:
-        inputs["attention_mask"] = inputs["attention_mask"][:, :inputs["input_ids"].shape[1]]
-        print("Adjusted attention_mask shape:", inputs["attention_mask"].shape)
-
-
-
     generated_ids = model.generate(**inputs, max_new_tokens=128)
 
     # generated_ids_trimmed = [
@@ -458,8 +494,8 @@ def main():
         blocks_to_remove = blocks_to_remove // 2
 
     for layer in layers:
-        dummy_initialize(getattr(layer, get_attn_layer_name(model)))
-        dummy_initialize(getattr(layer, get_mlp_layer_name(model)))
+        dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
+        dummy_initialize(getattr(layer, get_mlp_layer_name(model.model.language_model)))
 
     legal_mask = get_legal_mask(
         args.legal_to_drop_path, total_blocks
@@ -597,7 +633,7 @@ def main():
         layer_drop_config = get_layer_drop_config(population[0])
         if args.drop_config_dir:
             os.makedirs(args.drop_config_dir, exist_ok=True)
-            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_40.txt"), "w") as f:
+            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_20.txt"), "w") as f:
                 for line in layer_drop_config:
                     f.write(line + "\n")
 
@@ -610,7 +646,7 @@ def main():
         print("模型已保存至:", save_dir1)
 
         # Save layer drop config
-        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_40.txt"), "w") as f:
+        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_20.txt"), "w") as f:
             for line in layer_drop_config:
                 f.write(line + "\n")
 

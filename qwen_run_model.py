@@ -1,9 +1,52 @@
+from transformers import modeling_utils
+if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
+    # 只需填一个非空可迭代对象即可；这里给出官方目前支持的 4 种并行风格
+    modeling_utils.ALL_PARALLEL_STYLES = {"tp", "none", "colwise", "rowwise"}
+
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
+import types
+from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
+
+def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
+    """
+    A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
+    shape‑mismatch error when attention_mask contains vision tokens.
+    """
+    # When no mask is given, fall back to a simple arange.
+    if attention_mask is None:
+        seq_len = input_ids.size(1)
+        position_ids = torch.arange(
+            seq_len, dtype=torch.long, device=input_ids.device
+        ).unsqueeze(0).expand(input_ids.size(0), -1)
+        return position_ids, None
+
+    # Build position_ids sample‑by‑sample.
+    pos_list = []
+    for i in range(input_ids.size(0)):       # iterate over batch
+        text_mask = attention_mask[i] == 1   # keep only text tokens
+        pos = torch.arange(
+            text_mask.sum(),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        pos_list.append(pos)
+
+    # Pad to the longest sequence in the batch.
+    position_ids = torch.nn.utils.rnn.pad_sequence(
+        pos_list, batch_first=True, padding_value=0
+    )
+    return position_ids, None  # rope_deltas is unchanged
+
+# Monkey‑patch the model class
+qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
+    _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
+)
+
 import torch
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import numpy as np
 
@@ -47,19 +90,25 @@ def load_drop_config():
 
     return removed_state
 
+
 @torch.no_grad()
 def load_states(model, layers, removed_state):
-
+    # 深度拷贝removed_state
     removed_state = copy.deepcopy(removed_state)
+    # 如果drop_two_consecutive为True，则将removed_state中的attn和mlp列表中的每个元素都复制一遍
+    # if drop_two_consecutive:  # decompress: duplicate every entry
+    #     removed_state["attn"] = [removed_state["attn"][i // 2] for i in range(2 * len(removed_state["attn"]))]
+    #     removed_state["mlp"] = [removed_state["mlp"][i // 2] for i in range(2 * len(removed_state["mlp"]))]
 
+    # 遍历removed_state中的attn和mlp列表
     for subblock_type in ["attn", "mlp"]:
         for j in range(len(removed_state[subblock_type])):
             # 根据subblock_type获取对应的subblock
             # print("subblock_type:", subblock_type)
             if subblock_type == "attn":
-                subblock = getattr(layers[j], get_attn_layer_name(model))
+                subblock = getattr(layers[j], get_attn_layer_name(model.model.language_model))
             else:
-                subblock = getattr(layers[j], get_mlp_layer_name(model))
+                subblock = getattr(layers[j], get_mlp_layer_name(model.model.language_model))
             # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
             if removed_state[subblock_type][j]:
                 make_dummy_forward(subblock, subblock_type)
@@ -69,10 +118,25 @@ def load_states(model, layers, removed_state):
 
 # default: Load the model on the available device(s)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype="auto", device_map="auto"
+    "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype="auto", device_map="auto", trust_remote_code=True
 )
 
+# We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
+# model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+#     "Qwen/Qwen2.5-VL-7B-Instruct",
+#     torch_dtype=torch.bfloat16,
+#     attn_implementation="flash_attention_2",
+#     device_map="auto",
+# )
+
+# default processer
 processor = AutoProcessor.from_pretrained("/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct")
+
+# The default range for the number of visual tokens per image in the model is 4-16384.
+# You can set min_pixels and max_pixels according to your needs, such as a token range of 256-1280, to balance performance and cost.
+# min_pixels = 256*28*28
+# max_pixels = 1280*28*28
+# processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels)
 
 messages = [
     {
@@ -87,16 +151,21 @@ messages = [
     }
 ]
 
+
 layers = get_layers(model)
+print(f"Number of layers: {len(layers)}")
 
 for layer in layers:
-    dummy_initialize(getattr(layer, get_attn_layer_name(model)))
-    dummy_initialize(getattr(layer, get_mlp_layer_name(model)))
+    dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
+    dummy_initialize(getattr(layer, get_mlp_layer_name(model.model.language_model)))
 
+# 读取配置文件
 drop_config = load_drop_config()
 
 load_states(model, layers, drop_config)
 
+
+# Preparation for inference
 text = processor.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
 )
@@ -109,12 +178,14 @@ inputs = processor(
     return_tensors="pt",
 )
 inputs = inputs.to("cuda")
+
+# Inference: Generation of the output
 for _ in range(10):
-    generated_ids = model.generate(**inputs, max_new_tokens=128)
+    generated_ids = model.generate(**inputs, max_new_tokens=128, use_cache=True)
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-print(output_text)
+    print(output_text)

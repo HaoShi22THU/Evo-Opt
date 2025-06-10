@@ -1,6 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 import argparse
 import random
@@ -19,8 +19,55 @@ if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
     # 只需填一个非空可迭代对象即可；这里给出官方目前支持的 4 种并行风格
     modeling_utils.ALL_PARALLEL_STYLES = {"tp", "none", "colwise", "rowwise"}
 
+
 # 之后再导入 / 加载 Qwen2_5_VLForConditionalGeneration
 from transformers import Qwen2_5_VLForConditionalGeneration
+
+# ------------------------------------------------------------------------- #
+# Patch Qwen‑VL's buggy get_rope_index so it no longer triggers the
+# “mask length mismatch” IndexError.  The original implementation tries
+# to index `input_ids` with a mask of shape (seq_len,) in the *batch*
+# dimension.  Here we rewrite it so we first pick the current sample `i`
+# and then apply the mask along the sequence dimension.
+# ------------------------------------------------------------------------- #
+import types
+from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
+
+def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
+    """
+    A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
+    shape‑mismatch error when attention_mask contains vision tokens.
+    """
+    # When no mask is given, fall back to a simple arange.
+    if attention_mask is None:
+        seq_len = input_ids.size(1)
+        position_ids = torch.arange(
+            seq_len, dtype=torch.long, device=input_ids.device
+        ).unsqueeze(0).expand(input_ids.size(0), -1)
+        return position_ids, None
+
+    # Build position_ids sample‑by‑sample.
+    pos_list = []
+    for i in range(input_ids.size(0)):       # iterate over batch
+        text_mask = attention_mask[i] == 1   # keep only text tokens
+        pos = torch.arange(
+            text_mask.sum(),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        pos_list.append(pos)
+
+    # Pad to the longest sequence in the batch.
+    position_ids = torch.nn.utils.rnn.pad_sequence(
+        pos_list, batch_first=True, padding_value=0
+    )
+    return position_ids, None  # rope_deltas is unchanged
+
+# Monkey‑patch the model class
+qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
+    _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
+)
+# ------------------------------------------------------------------------- #
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import  AutoProcessor, AutoConfig
@@ -54,39 +101,83 @@ import PIL.Image
 def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer):
     device = next(model.parameters()).device
 
+    # model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
+
+    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+
+    # # print(model.model)
+    # processor = AutoProcessor.from_pretrained(model_path)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+
+    inputs.pop("attention_mask", None)   # avoid mask‑length mismatch
+
     generated_ids = model.generate(
-        **prompt,
+        **inputs,
         max_new_tokens=128,
         use_cache=True
     )
 
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(prompt.input_ids, generated_ids)
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     answer = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    def safe_tokenize(texts, max_length=76):
-        flat = []
-        for t in texts:
-            if isinstance(t, (list, tuple)):
-                flat.extend(t)       # 把 list[str] 展平
-            else:
-                flat.append(t)
-        tokens = clip.tokenize(flat, truncate=True)
-        return tokens.to(device)
 
-    text_inputs = safe_tokenize([answer, base_answer])
-    # 提取特征向量
-    with torch.no_grad():
-        text_features = clip_model.encode_text(text_inputs)
-    # 归一化
-    text_features /= text_features.norm(dim=-1, keepdim=True)
-    # 计算相似度
-    similarity = (text_features[0] @ text_features[1].T).item()
-    print('similarity:', similarity)
-    return similarity
-    # return -1
+    
+
+    # def safe_tokenize(texts, max_length=76):
+    #     flat = []
+    #     for t in texts:
+    #         if isinstance(t, (list, tuple)):
+    #             flat.extend(t)       # 把 list[str] 展平
+    #         else:
+    #             flat.append(t)
+    #     tokens = clip.tokenize(flat, truncate=True)
+    #     return tokens.to(device)
+
+    # text_inputs = safe_tokenize([answer, base_answer])
+    
+    # # 提取特征向量
+    # with torch.no_grad():
+    #     text_features = clip_model.encode_text(text_inputs)
+
+    # # 归一化
+    # text_features /= text_features.norm(dim=-1, keepdim=True)
+
+    # # 计算相似度
+    # similarity = (text_features[0] @ text_features[1].T).item()
+
+    # print('similarity:', similarity)
+   
+    # return similarity
+    return -1
+
 
 def get_layer_drop_config(removed_state) -> List[str]:
     # 获取removed_state中attn的长度
@@ -150,7 +241,8 @@ def is_valid_state(removed_state, legal_to_drop):
     # 如果所有子块都符合条件，则返回True
     return True
 
-def load_states(model, layers, removed_state, drop_two_consecutive):
+
+def load_states(model, layers, removed_state):
     # 深度拷贝removed_state
     removed_state = copy.deepcopy(removed_state)
 
@@ -159,9 +251,9 @@ def load_states(model, layers, removed_state, drop_two_consecutive):
         for j in range(len(removed_state[subblock_type])):
             # 根据subblock_type获取对应的subblock
             if subblock_type == "attn":
-                subblock = getattr(layers[j], get_attn_layer_name(model))
+                subblock = getattr(layers[j], get_attn_layer_name(model.model.language_model))
             else:
-                subblock = getattr(layers[j], get_mlp_layer_name(model))
+                subblock = getattr(layers[j], get_mlp_layer_name(model.model.language_model))
             # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
             if removed_state[subblock_type][j]:
                 make_dummy_forward(subblock, subblock_type)
@@ -169,17 +261,99 @@ def load_states(model, layers, removed_state, drop_two_consecutive):
             else:
                 restore_forward(subblock)
 
-def compute_fitness(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answers, data, fitness_fn, invert_fitness, target_logits: Optional[torch.Tensor] = None) -> float:
+def compute_fitness(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answers, data, fitness_fn, invert_fitness, candidate, target_logits: Optional[torch.Tensor] = None) -> float:
     # 定义一个变量sign，默认为1
     sign = 1
     # 如果invert_fitness为True，则将sign赋值为-1
     if invert_fitness:
         sign = -1
 
-    # 如果fitness_fn为"ppl"，则调用compute_perplexity函数计算perplexity
-    if fitness_fn == "ppl":
-        return sign * compute_clip(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answers)
-    # 否则，调用compute_kl_div函数计算kl_div
+    device = next(model.parameters()).device
+
+    # model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
+
+    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+
+    layers = get_layers(model)
+
+    # print(model.model)
+    # processor = AutoProcessor.from_pretrained(model_path)
+
+    for layer in layers:
+        dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
+        dummy_initialize(getattr(layer, get_mlp_layer_name(model.model.language_model)))
+
+    load_states(model, layers, candidate)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+    # inputs.pop("attention_mask", None)
+
+    inputs.pop("attention_mask", None)
+
+
+    generated_ids = model.generate(
+        **inputs,
+        max_new_tokens=128,
+        use_cache=True
+    )
+
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    answer = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+
+    def safe_tokenize(texts, max_length=76):
+        flat = []
+        for t in texts:
+            if isinstance(t, (list, tuple)):
+                flat.extend(t)       # 把 list[str] 展平
+            else:
+                flat.append(t)
+        tokens = clip.tokenize(flat, truncate=True)
+        return tokens.to(device)
+
+    text_inputs = safe_tokenize([answer, base_answers])
+    
+    # 提取特征向量
+    with torch.no_grad():
+        text_features = clip_model.encode_text(text_inputs)
+
+    # 归一化
+    text_features /= text_features.norm(dim=-1, keepdim=True)
+
+    # 计算相似度
+    similarity = (text_features[0] @ text_features[1].T).item()
+
+    print('similarity:', similarity)
+   
+    return sign * similarity
+
 
 def selection(
     model,
@@ -203,15 +377,16 @@ def selection(
 
     fitnesses = []
     for candidate in candidates:
-        load_states(model, layers, candidate, drop_two_consecutive)
+        
         # pristine_prompt = {k: v.clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v)
         #                for k, v in prompt.items()} 
-        fitness = compute_fitness(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer, test_data, fitness_fn, invert_fitness)
+        fitness = compute_fitness(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer, test_data, fitness_fn, invert_fitness, candidate)
         fitnesses.append(fitness)
 
     # Keep only best
     best_ids = np.argsort(fitnesses)[:num_survive]
     return [candidates[i] for i in best_ids], [fitnesses[i] for i in best_ids]
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -326,6 +501,85 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+# def caculate_score(model, processor, clip_model, clip_preprocess, prompt, base_answer, candidate):
+#     device = next(model.parameters()).device
+#     model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
+
+#     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+
+#     # print(model.model)
+#     processor = AutoProcessor.from_pretrained(model_path)
+
+#     messages = [
+#         {
+#             "role": "user",
+#             "content": [
+#                 {
+#                     "type": "image",
+#                     "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+#                 },
+#                 {"type": "text", "text": "Describe this image."},
+#             ],
+#         }
+#     ]
+#     text = processor.apply_chat_template(
+#     messages, tokenize=False, add_generation_prompt=True
+#     )
+    
+#     image_inputs, video_inputs = process_vision_info(messages)
+#     inputs = processor(
+#         text=[text],
+#         images=image_inputs,
+#         videos=video_inputs,
+#         padding=True,
+#         return_tensors="pt",
+#     )
+#     inputs = inputs.to("cuda")
+#     # inputs.pop("attention_mask", None)
+
+#     generated_ids = model.generate(
+#         **inputs,
+#         max_new_tokens=128,
+#         use_cache=True
+#     )
+
+#     generated_ids_trimmed = [
+#         out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+#     ]
+#     answer = processor.batch_decode(
+#         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+#     )
+
+#     def safe_tokenize(texts, max_length=76):
+#         flat = []
+#         for t in texts:
+#             if isinstance(t, (list, tuple)):
+#                 flat.extend(t)       # 把 list[str] 展平
+#             else:
+#                 flat.append(t)
+#         tokens = clip.tokenize(flat, truncate=True)
+#         return tokens.to(device)
+
+#     text_inputs = safe_tokenize([answer, base_answer])
+    
+#     # 提取特征向量
+#     with torch.no_grad():
+#         text_features = clip_model.encode_text(text_inputs)
+
+#     # 归一化
+#     text_features /= text_features.norm(dim=-1, keepdim=True)
+
+#     # 计算相似度
+#     similarity = (text_features[0] @ text_features[1].T).item()
+
+#     print('similarity:', similarity)
+   
+#     return -similarity
+    
+
+
+
+
 def main():
     args = parse_args()
     assert len(args.survivors_per_selection) == len(
@@ -377,6 +631,12 @@ def main():
 
     generated_ids = model.generate(**inputs, max_new_tokens=128)
 
+    # generated_ids_trimmed = [
+    #     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    # ]
+    # base_answers = processor.batch_decode(
+    #     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    # )
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
@@ -403,8 +663,8 @@ def main():
         blocks_to_remove = blocks_to_remove // 2
 
     for layer in layers:
-        dummy_initialize(getattr(layer, get_attn_layer_name(model)))
-        dummy_initialize(getattr(layer, get_mlp_layer_name(model)))
+        dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
+        dummy_initialize(getattr(layer, get_mlp_layer_name(model.model.language_model)))
 
     legal_mask = get_legal_mask(
         args.legal_to_drop_path, total_blocks
@@ -462,7 +722,7 @@ def main():
         for parent in population:
             print(f"Parent: attn: {[int(ele) for ele in parent['attn']]} mlp: {[int(ele) for ele in parent['mlp']]}")
 
-        load_states(model, layers, population[0], args.drop_two_consecutive)
+        load_states(model, layers, population[0])
 
         # Evaluate current search point
         # if gen_id % args.eval_every == 0 and not args.no_eval:
@@ -527,7 +787,7 @@ def main():
                 clip_preprocess=clip_preprocess,
                 layers=layers,
                 candidates=offspring_list,
-                prompt=inputs,
+                prompt=copy.deepcopy(inputs),
                 base_answer=base_answers,
                 num_survive=num_survive,
                 calibration_data=calibration_data,
@@ -565,3 +825,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+    

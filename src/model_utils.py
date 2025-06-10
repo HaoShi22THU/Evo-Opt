@@ -55,6 +55,7 @@ def get_layers(model: AutoModelForCausalLM):
         # return model.layers
     if model.config.model_type in ("qwen2_5_vl"):
         return model.model.language_model.layers
+        # return model.visual.blocks
     if model.config.model_type == "opt":
         return model.model.decoder.layers
     else:
