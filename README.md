@@ -29,15 +29,15 @@ We provide 2 files for the layer skip of the inference of Janus Pro 7B:
 ---
 We provide 2 files for the layer skip of the inference of Qwen2.5-vl:
 
-* `janus_inference_evo_press.py` - layer skip for the inference process of Qwen2.5-vl via clip socre
-* `janus_inference_run_model.py` - run the skipped Qwen2.5-vl via given pattern in inference
+* `qwen_evo_press.py` - layer skip for the inference process of Qwen2.5-vl via clip socre
+* `qwen_run_model.py` - run the skipped Qwen2.5-vl via given pattern in inference
 
 ### Stable Diffusion 3
 
 We provide 2 files for the layer skip of the inference of Stable Diffusion 3:
 
 * `sd3_evopress_timestep_attn.py` - attn skip for the generation process of Stable Diffusion 3 via clip socre, SSIM and PSNR
-* `janus_inference_run_model.py` - run the skipped Stable Diffusion 3 via given pattern in generation
+* `sd3_run_model.py` - run the skipped Stable Diffusion 3 via given pattern in generation
 
 
 ## Environment

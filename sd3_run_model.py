@@ -539,7 +539,7 @@ def main():
         model_dir, torch_dtype=torch.float16
     ).to("cuda")
 
-    with open ("/mnt/temp/hshi/EvoPress/EvoPress/timestep_drop_config_90.txt", "r") as f:
+    with open ("/mnt/temp/hshi/EvoPress/EvoPress/timestep_drop_config_70.txt", "r") as f:
         lines = f.readlines()
     # 读取每一行的内容
 
@@ -557,8 +557,8 @@ def main():
     print(reuse_steps)
     patch_sd3_reuse_attn(pipe_fast, reuse_steps=reuse_steps)
 
-    prompt = "A close-up high-contrast photo of Sydney Opera House sitting next to Eiffel tower, under a blue night sky of roiling energy, exploding yellow stars, and radiating swirls of blue."
-
+    # prompt = "A close-up high-contrast photo of Sydney Opera House sitting next to Eiffel tower, under a blue night sky of roiling energy, exploding yellow stars, and radiating swirls of blue."
+    prompt = "lsometric voxel art of a gamer's room withRGB-lit computer setup, posters on the wall, acharacter gaming in a chair, and a cat sitting on the desk by the keyboard."
     # ---------- 5.3 baseline 时间 ----------
     torch.cuda.synchronize()
     t0 = time.time()
@@ -577,8 +577,8 @@ def main():
 
     # ---------- 5.5 保存图片 ----------
     os.makedirs("generated_samples", exist_ok=True)
-    out_path_base = "generated_samples/output_base.png"
-    out_path_fast = "generated_samples/output_fast.png"
+    out_path_base = "generated_samples/output_base_1.png"
+    out_path_fast = "generated_samples/output_fast_70_1.png"
 
     image_base.images[0].save(out_path_base)
     image_fast.images[0].save(out_path_fast)

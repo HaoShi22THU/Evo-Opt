@@ -522,8 +522,6 @@ def main():
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
-
-
     os.environ["CUDA_VISIBLE_DEVICES"] = "1"    # ← 改为可用 GPU
     model_dir = "/mnt/temp/hshi/SD3/stable-diffusion-3-medium-diffusers"  # ← 改为模型路径
 

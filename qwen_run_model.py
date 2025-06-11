@@ -6,43 +6,7 @@ if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-import types
-from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
 
-def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
-    """
-    A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
-    shape‑mismatch error when attention_mask contains vision tokens.
-    """
-    # When no mask is given, fall back to a simple arange.
-    if attention_mask is None:
-        seq_len = input_ids.size(1)
-        position_ids = torch.arange(
-            seq_len, dtype=torch.long, device=input_ids.device
-        ).unsqueeze(0).expand(input_ids.size(0), -1)
-        return position_ids, None
-
-    # Build position_ids sample‑by‑sample.
-    pos_list = []
-    for i in range(input_ids.size(0)):       # iterate over batch
-        text_mask = attention_mask[i] == 1   # keep only text tokens
-        pos = torch.arange(
-            text_mask.sum(),
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        pos_list.append(pos)
-
-    # Pad to the longest sequence in the batch.
-    position_ids = torch.nn.utils.rnn.pad_sequence(
-        pos_list, batch_first=True, padding_value=0
-    )
-    return position_ids, None  # rope_deltas is unchanged
-
-# Monkey‑patch the model class
-qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
-    _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
-)
 
 import torch
 import os

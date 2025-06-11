@@ -90,7 +90,8 @@ def compute_clip(pipe, clip_model, clip_preprocess, prompt):
     print(f'CLIP sim = {clip_val:.3f}')
     alpha, beta, gamma = 0.40, 0.35, 0.25
     
-    return alpha * clip_val + beta * ssim_val + gamma * psnr_val
+    # return alpha * clip_val + beta * ssim_val + gamma * psnr_val
+    return beta * ssim_val + gamma * psnr_val
 
 
 # def get_layer_drop_config(removed_state) -> List[str]:
