@@ -51,13 +51,19 @@ class Catcher(nn.Module):
 
 def get_layers(model: AutoModelForCausalLM):
     if model.config.model_type in ("llama", "gemma", "gemma2", "phi3", "mistral"):
-        return model.model.layers
+        return model.layers
         # return model.layers
     if model.config.model_type in ("qwen2_5_vl"):
         return model.model.language_model.layers
         # return model.visual.blocks
     if model.config.model_type == "opt":
         return model.model.decoder.layers
+    else:
+        raise ValueError(f"{model.config.model_type} is not supported.")
+
+def get_layers_vit(model: AutoModelForCausalLM):
+    if model.config.model_type in ("qwen2_5_vl"):
+        return model.model.visual.blocks
     else:
         raise ValueError(f"{model.config.model_type} is not supported.")
 
@@ -107,6 +113,18 @@ def get_attn_layer_name(model: AutoModelForCausalLM):
     
     else:
         raise ValueError(f"{model.config.model_type} is not supported.")
+    
+def get_attn_layer_name_vit(model: AutoModelForCausalLM):
+    if model.config.model_type in ("qwen2_5_vl"):
+        return "attn"
+    else:
+        raise ValueError(f"{model.config.model_type} is not supported.")
+    
+def get_mlp_layer_name_vit(model: AutoModelForCausalLM):
+    if model.config.model_type in ("qwen2_5_vl"):
+        return "attn"
+    else:
+        raise ValueError(f"{model.config.model_type} is not supported.")
 
 # def get_attn_layer_name(model: AutoModelForCausalLM):
 #     if model.config.model_type in ("llama", "mistral", "qwen2_5_vl"):
@@ -151,25 +169,143 @@ def dummy_initialize(module: nn.Module) -> None:
     module.__forward = module.forward
 
 ######
+# def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
+#     assert layer_type in ["attn+mlp", "attn", "mlp"]
+#     # Forward that returns first argument
+#     if layer_type == "attn+mlp":
+
+#         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+#             return (hidden_states,)
+
+#     elif layer_type == "attn":
+
+#         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+#             return 0, None, None
+
+#     elif layer_type == "mlp":
+
+#         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+#             return 0
+
+#     module.forward = MethodType(dummy_forward, module)
 def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
+    """
+    Replace `module.forward` with a lightweight stub so that pruned layers
+    keep tensor shapes和 KV-Cache length consistent.
+
+    layer_type:
+        "attn+mlp" → 整个 block 都裁掉
+        "attn"     → 只裁掉注意力
+        "mlp"      → 只裁掉 MLP
+    """
     assert layer_type in ["attn+mlp", "attn", "mlp"]
-    # Forward that returns first argument
+
+    # ——————————————————————————————————————————
+    # 1. 整块裁掉：仍需返回三元组
+    # ——————————————————————————————————————————
     if layer_type == "attn+mlp":
 
-        def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-            return (hidden_states,)
+        def dummy_forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
+            **kwargs,
+        ):
+            # 1) Propagate hidden states unchanged
+            output = hidden_states
 
+            # 2) Handle KV‑Cache when requested
+            if use_cache:
+                # If this is *not* the first forward pass, `past_key_value`
+                # is already a Cache object. We simply update it with 0‑len
+                # tensors so the sequence length stays consistent.
+                if past_key_value is not None and hasattr(past_key_value, "update"):
+                    bsz, _, hidden_dim = hidden_states.shape
+                    head_dim = getattr(self, "head_dim", hidden_dim // getattr(self, "num_heads", 1))
+                    num_kv_heads = getattr(self, "num_key_value_heads", getattr(self, "num_heads", 1))
+                    empty_k = hidden_states.new_empty(bsz, num_kv_heads, 0, head_dim)
+                    empty_v = hidden_states.new_empty(bsz, num_kv_heads, 0, head_dim)
+                    past_key_value.update(empty_k, empty_v, getattr(self, "layer_idx", 0), {})
+                present = past_key_value  # return the (possibly updated) Cache object
+            else:
+                present = None
+
+            # 3) Always return the standard triple expected by Transformer blocks
+            return output, None, present
+
+    # ——————————————————————————————————————————
+    # 2. 仅裁掉注意力：需要占位 KV
+    # ——————————————————————————————————————————
     elif layer_type == "attn":
 
-        def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-            return 0, None, None
+        def dummy_forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
+            **kwargs,
+        ):
+            # 1) Propagate hidden states unchanged
+            # output = hidden_states
 
+            # 2) Handle KV‑Cache when requested
+            if use_cache:
+                # If this is *not* the first forward pass, `past_key_value`
+                # is already a Cache object. We simply update it with 0‑len
+                # tensors so the sequence length stays consistent.
+                if past_key_value is not None and hasattr(past_key_value, "update"):
+                    bsz, _, hidden_dim = hidden_states.shape
+                    head_dim = getattr(self, "head_dim", hidden_dim // getattr(self, "num_heads", 1))
+                    num_kv_heads = getattr(self, "num_key_value_heads", getattr(self, "num_heads", 1))
+                    empty_k = hidden_states.new_empty(bsz, num_kv_heads, 0, head_dim)
+                    empty_v = hidden_states.new_empty(bsz, num_kv_heads, 0, head_dim)
+                    past_key_value.update(empty_k, empty_v, getattr(self, "layer_idx", 0), {})
+                present = past_key_value  # return the (possibly updated) Cache object
+            else:
+                present = None
+
+            # 3) Always return the standard triple expected by Transformer blocks
+            return 0, None, present
+
+    # ——————————————————————————————————————————
+    # 3. 仅裁掉 MLP：保留 attn，返回 hidden_states
+    # ——————————————————————————————————————————
     elif layer_type == "mlp":
 
         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-            return 0
+            return 0  # 只需保持残差；不涉及 KV
 
+    # 绑定新的 forward
     module.forward = MethodType(dummy_forward, module)
+
+# def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
+#     assert layer_type in ["attn+mlp", "attn", "mlp"]
+#     # Forward that returns first argument
+#     if layer_type == "attn+mlp":
+
+#         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+#             return (hidden_states,)
+
+#     elif layer_type == "attn":
+
+#         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+#             return 0, None, None
+
+#     elif layer_type == "mlp":
+
+#         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+#             return 0
+
+#     module.forward = MethodType(dummy_forward, module)
+
+
 
 #####
 def restore_forward(module: nn.Module) -> None:

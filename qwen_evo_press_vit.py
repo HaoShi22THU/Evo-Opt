@@ -1,10 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
-from transformers import modeling_utils
-if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
-    modeling_utils.ALL_PARALLEL_STYLES = {"tp", "none", "colwise", "rowwise"}
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import argparse
 import random
@@ -17,8 +13,56 @@ from typing import List, Optional
 import clip
 import torch
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import modeling_utils
 
+if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
+    # 只需填一个非空可迭代对象即可；这里给出官方目前支持的 4 种并行风格
+    modeling_utils.ALL_PARALLEL_STYLES = {"tp", "none", "colwise", "rowwise"}
+
+# 之后再导入 / 加载 Qwen2_5_VLForConditionalGeneration
+from transformers import Qwen2_5_VLForConditionalGeneration
+
+import types
+from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
+
+def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
+    """
+    A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
+    shape‑mismatch error when attention_mask contains vision tokens.
+    """
+    # When no mask is given, fall back to a simple arange.
+    if attention_mask is None:
+        seq_len = input_ids.size(1)
+        position_ids = torch.arange(
+            seq_len, dtype=torch.long, device=input_ids.device
+        ).unsqueeze(0).expand(input_ids.size(0), -1)
+        return position_ids, None
+
+    # Build position_ids sample‑by‑sample.
+    pos_list = []
+    for i in range(input_ids.size(0)):       # iterate over batch
+        text_mask = attention_mask[i] == 1   # keep only text tokens
+        pos = torch.arange(
+            text_mask.sum(),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        pos_list.append(pos)
+
+    # Pad to the longest sequence in the batch.
+    position_ids = torch.nn.utils.rnn.pad_sequence(
+        pos_list, batch_first=True, padding_value=0
+    )
+    return position_ids, None  # rope_deltas is unchanged
+
+# Monkey‑patch the model class
+qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
+    _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
+)
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import  AutoProcessor, AutoConfig
+from qwen_vl_utils import process_vision_info
 
 from src.data_utils import get_data
 from src.common_utils import fix_seed
@@ -30,6 +74,12 @@ from src.model_utils import (
     make_dummy_forward,
     dummy_initialize,
     restore_forward,
+)
+
+from src.model_utils import (
+    get_layers_vit,
+    get_attn_layer_name_vit,
+    get_mlp_layer_name_vit,
 )
 # from src.metrics import compute_perplexity, compute_kl_div
 
@@ -44,136 +94,72 @@ import numpy as np
 import os
 import PIL.Image
 
-
-# @torch.no_grad()
-# def compute_perplexity(model, data, batch_size: int = 1):
-#     num_samples = len(data)
-#     device = next(model.parameters()).device
-#     # Running estimate of negative log-likelihood
-#     nll_running = 0
-#     # Number of tokens processed to far
-#     tokens_processed = 0
-
-#     cfg_weight = 5
-#     temperature = 1.0
-#     # Loop through each batch
-#     for i in trange(0, num_samples, batch_size, desc="Computing perplexity", leave=False):
-#         j = min(i + batch_size, num_samples)
-#         inputs = data[:,:,i:j].to(device)
-#         # Forward pass through the model
-#         inputs = inputs.permute(0, 2, 1)
-
-#         outputs = model.language_model.model(inputs_embeds=inputs, use_cache=True, past_key_values=outputs.past_key_values if i != 0 else None)
-#         hidden_states = outputs.last_hidden_state
-        
-#         logits = model.gen_head(hidden_states[:, -1, :])
-#         logit_cond = logits[0::2, :]
-#         logit_uncond = logits[1::2, :]
-        
-#         logits = logit_uncond + cfg_weight * (logit_cond-logit_uncond)
-#         lm_logits = torch.softmax(logits / temperature, dim=-1)
-
-#         # lm_logits = model(inputs).logits
-#         # Shift logits and labels for next token prediction
-#         shift_logits = lm_logits[:, :-1].contiguous()
-#         shift_labels = inputs[:, 1:]
-#         # Compute loss
-#         loss = F.cross_entropy(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-#         # Calculate negative log likelihood
-#         a = shift_labels.numel() / (tokens_processed + shift_labels.numel())
-#         b = tokens_processed / (tokens_processed + shift_labels.numel())
-#         nll_running = a * loss + b * nll_running
-#         # Update number of processed tokens
-#         tokens_processed += shift_labels.numel()
-#     # Compute perplexity
-#     ppl = nll_running.exp().item()
-#     return ppl
-
-# def calculate_ppl(model, generated_tokens, logits_history):
-#     total_nll = 0.0
-#     num_tokens = generated_tokens.shape[1]  # image_token_num_per_image
-    
-#     for i in range(num_tokens):
-#         # 获取当前token的真实ID和对应logits
-#         current_token = generated_tokens[:, i]  # shape: [parallel_size]
-#         current_logits = logits_history[i]      # shape: [parallel_size, vocab_size]
-#         # print(current_logits.dtype)
-#         # 计算负对数似然
-#         probs = torch.softmax(current_logits, dim=-1)
-#         nll = -torch.log(probs.gather(1, current_token.unsqueeze(1).long())).mean()
-#         total_nll += nll.item()
-    
-#     return torch.exp(torch.tensor(total_nll / num_tokens)).item()
-
-# @torch.no_grad()
-# def compute_perplexity(model, prompt, data, batch_size: int = 1):
-
-#     device = next(model.parameters()).device
-#     parallel_size = 1
-#     image_token_num_per_image = 576
-#     cfg_weight = 5
-#     temperature = 1.0
-    
-#     inputs_embeds = prompt.to(device)
-#     generated_tokens = torch.zeros((parallel_size, image_token_num_per_image), dtype=torch.long).cuda()
-
-#     logits_history = []
-#     for i in range(576):
-#         outputs = model.language_model.model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=outputs.past_key_values if i != 0 else None)
-#         hidden_states = outputs.last_hidden_state
-        
-#         logits = model.gen_head(hidden_states[:, -1, :])
-#         logit_cond = logits[0::2, :]
-#         logit_uncond = logits[1::2, :]
-        
-#         logits = logit_uncond + cfg_weight * (logit_cond-logit_uncond)
-#         logits_history.append(logits)
-#         probs = torch.softmax(logits / temperature, dim=-1)
-
-#         next_token = torch.multinomial(probs, num_samples=1)
-#         generated_tokens[:, i] = next_token.squeeze(dim=-1)
-
-#         next_token = torch.cat([next_token.unsqueeze(dim=1), next_token.unsqueeze(dim=1)], dim=1).view(-1)
-#         img_embeds = model.prepare_gen_img_embeds(next_token)
-        
-#         inputs_embeds = img_embeds.unsqueeze(dim=1)
-#     ppl = calculate_ppl(model, generated_tokens, logits_history)
-#     # ppl = random.randint(0, 100)
-#     return ppl
-
 @torch.no_grad()
-def compute_clip(model, model_full, clip_model, clip_preprocess, prompt, tokenizer, base_answer):
+def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer):
     device = next(model.parameters()).device
 
-    inputs_embeds = model.prepare_inputs_embeds(**prompt)
+    # model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
 
-    layers = get_layers(model.language_model.model)
+    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
 
-    # # run the model to get the response
-    answers = model.language_model.generate(
-        inputs_embeds=inputs_embeds,
-        attention_mask=prompt.attention_mask,
-        pad_token_id=tokenizer.eos_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        max_new_tokens=512,
-        do_sample=False,
-        use_cache=False,
+    # # print(model.model)
+    # processor = AutoProcessor.from_pretrained(model_path)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
     )
-    answer = tokenizer.decode(answers[0].cpu().tolist(), skip_special_tokens=True)
-    # print(f"{prompt['sft_format'][0]}", answer)
+    
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+    # inputs.pop("attention_mask", None)
 
-    from collections import OrderedDict
+    generated_ids = model.generate(
+        **inputs,
+        max_new_tokens=128,
+        use_cache=True
+    )
+
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    answer = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+
+    
 
     def safe_tokenize(texts, max_length=76):
-        tokens = clip.tokenize(texts, truncate=True)  # 自动截断
+        flat = []
+        for t in texts:
+            if isinstance(t, (list, tuple)):
+                flat.extend(t)       # 把 list[str] 展平
+            else:
+                flat.append(t)
+        tokens = clip.tokenize(flat, truncate=True)
         return tokens.to(device)
 
     text_inputs = safe_tokenize([answer, base_answer])
     
-
-    # text_inputs = clip.tokenize([answer, base_answer]).to(device)
-
     # 提取特征向量
     with torch.no_grad():
         text_features = clip_model.encode_text(text_inputs)
@@ -184,13 +170,10 @@ def compute_clip(model, model_full, clip_model, clip_preprocess, prompt, tokeniz
     # 计算相似度
     similarity = (text_features[0] @ text_features[1].T).item()
 
-    # print("answers:", answers)
-    # # Get logits for the base answers
-
-    # print("base_answer:", base_answer)
     print('similarity:', similarity)
    
     return similarity
+    # return -1
 
 
 def get_layer_drop_config(removed_state) -> List[str]:
@@ -256,30 +239,39 @@ def is_valid_state(removed_state, legal_to_drop):
     return True
 
 
-def load_states(model, layers, removed_state, drop_two_consecutive):
+def load_states(model, layers, blocks,removed_state):
     # 深度拷贝removed_state
     removed_state = copy.deepcopy(removed_state)
-    # 如果drop_two_consecutive为True，则将removed_state中的attn和mlp列表中的每个元素都复制一遍
-    if drop_two_consecutive:  # decompress: duplicate every entry
-        removed_state["attn"] = [removed_state["attn"][i // 2] for i in range(2 * len(removed_state["attn"]))]
-        removed_state["mlp"] = [removed_state["mlp"][i // 2] for i in range(2 * len(removed_state["mlp"]))]
 
     # 遍历removed_state中的attn和mlp列表
     for subblock_type in ["attn", "mlp"]:
-        for j in range(len(removed_state[subblock_type])):
+        for j in range(len(layers)):
             # 根据subblock_type获取对应的subblock
             if subblock_type == "attn":
-                subblock = getattr(layers[j], get_attn_layer_name(model.language_model.model))
+                subblock = getattr(layers[j], get_attn_layer_name(model.model))
             else:
-                subblock = getattr(layers[j], get_mlp_layer_name(model.language_model.model))
+                subblock = getattr(layers[j], get_mlp_layer_name(model.model))
             # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
             if removed_state[subblock_type][j]:
                 make_dummy_forward(subblock, subblock_type)
             # 否则，将subblock恢复为正常的forward
             else:
                 restore_forward(subblock)
+    
+    for subblock_type in ["attn", "mlp"]:
+        for j in range(len(blocks)):
+            if subblock_type == "attn":
+                subblock = getattr(blocks[j], get_attn_layer_name_vit(model.model))
+            else:
+                subblock = getattr(blocks[j], get_mlp_layer_name_vit(model.model))
+            # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
+            if removed_state[subblock_type][j+len(layers)]:
+                make_dummy_forward(subblock, subblock_type)
+            # 否则，将subblock恢复为正常的forward
+            else:
+                restore_forward(subblock)
 
-def compute_fitness(model, model_full, clip_model, clip_preprocess, prompt, tokenizer, base_answers, data, fitness_fn, invert_fitness, target_logits: Optional[torch.Tensor] = None) -> float:
+def compute_fitness(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answers, data, fitness_fn, invert_fitness, target_logits: Optional[torch.Tensor] = None) -> float:
     # 定义一个变量sign，默认为1
     sign = 1
     # 如果invert_fitness为True，则将sign赋值为-1
@@ -288,65 +280,18 @@ def compute_fitness(model, model_full, clip_model, clip_preprocess, prompt, toke
 
     # 如果fitness_fn为"ppl"，则调用compute_perplexity函数计算perplexity
     if fitness_fn == "ppl":
-        return sign * compute_clip(model, model_full, clip_model, clip_preprocess, prompt, tokenizer, base_answers)
+        return sign * compute_clip(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answers)
     # 否则，调用compute_kl_div函数计算kl_div
-    
-
-
-# def selection(
-#     model,
-#     layers,
-#     candidates,
-#     num_survive: int,
-#     calibration_data,
-#     num_tokens: int,
-#     drop_two_consecutive: bool,
-#     invert_fitness: bool,
-#     fitness_fn: str = "ppl",
-#     target_logits: Optional[List[torch.Tensor]] = None,
-# ):
-#     # 初始化 calibration_minibatch、minibatch_ids、target_logits_minibatch 和 tokens_used
-#     calibration_minibatch = []
-#     minibatch_ids = []
-#     target_logits_minibatch = []
-#     tokens_used = 0
-#     while tokens_used < num_tokens:  # generate minibatch with exactly num_tokens tokens
-#         minibatch_id = random.randint(0, len(calibration_data) - 1)
-#         if minibatch_id in minibatch_ids:  # avoid duplicates
-#             continue
-#         minibatch_ids.append(minibatch_id)
-#         if tokens_used + calibration_data[minibatch_id].shape[1] > num_tokens:
-#             calibration_minibatch.append(calibration_data[minibatch_id][:, : num_tokens - tokens_used])
-#             if fitness_fn == "kl":
-#                 target_logits_minibatch.append(target_logits[minibatch_id][:, : num_tokens - tokens_used])
-#             tokens_used = num_tokens
-#         else:
-#             calibration_minibatch.append(calibration_data[minibatch_id])
-#             if fitness_fn == "kl":
-#                 target_logits_minibatch.append(target_logits[minibatch_id])
-#             tokens_used += calibration_data[minibatch_id].shape[1]
-
-#     if len(target_logits_minibatch) == 0:
-#         target_logits_minibatch = None
-#     fitnesses = []
-#     for candidate in candidates:
-#         load_states(model.language_model.model, layers, candidate, drop_two_consecutive)
-#         fitness = compute_fitness(model, calibration_minibatch, fitness_fn, invert_fitness, target_logits_minibatch)
-#         fitnesses.append(fitness)
-#     # Keep only best
-#     best_ids = np.argsort(fitnesses)[:num_survive]
-#     return [candidates[i] for i in best_ids], [fitnesses[i] for i in best_ids]
-
 
 def selection(
     model,
     model_full,
+    processor,
     clip_model,
     clip_preprocess,
     layers,
     candidates,
     prompt,
-    tokenizer,
     base_answer,
     num_survive: int,
     calibration_data,
@@ -358,10 +303,14 @@ def selection(
     ## 选定测试数据
     test_data = calibration_data[:,:num_tokens]
 
+    blocks = get_layers_vit(model)
+
     fitnesses = []
     for candidate in candidates:
-        load_states(model, layers, candidate, drop_two_consecutive)
-        fitness = compute_fitness(model, model_full, clip_model, clip_preprocess, prompt, tokenizer, base_answer, test_data, fitness_fn, invert_fitness)
+        load_states(model, layers, blocks, candidate)
+        # pristine_prompt = {k: v.clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v)
+        #                for k, v in prompt.items()} 
+        fitness = compute_fitness(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer, test_data, fitness_fn, invert_fitness)
         fitnesses.append(fitness)
 
     # Keep only best
@@ -407,7 +356,7 @@ def parse_args():
     parser.add_argument("--eval_tokens", default=524288, type=int, help="Number of tokens for evaluation.")
     parser.add_argument("--eval_sequence_length", default=None, type=int, help="Length of evaluation sequences.")
     # Sparsification params
-    parser.add_argument("--sparsity", type=float, default=0.40, help="Fraction of layers to drop.")
+    parser.add_argument("--sparsity", type=float, default=0.20, help="Fraction of layers to drop.")
     # Logging params
     parser.add_argument("--log_wandb", default=False, action="store_true", help="Whether to log to W&B")
     # Evolutionary Search paramsss
@@ -492,74 +441,71 @@ def main():
     if args.drop_two_consecutive:
         assert args.drop_entire_block, "Can't drop two consecutive without dropping entire block"
         assert args.legal_to_drop_path == None, "Not implemented"
-    # Get device and dtype
 
     print(args.generations)
     device = f"cuda"
 
     import torch 
     fix_seed(args.seed)
-    # random.seed(args.seed)
 
+    model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
 
-    # torch.manual_seed(args.seed)
-    # torch.cuda.manual_seed(args.seed)
-    # torch.cuda.manual_seed_all(args.seed)  # 多GPU场景
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
 
-    
-    model_path = "/mnt/temp/hshi/SD3/Janus-Pro-7B"
-    vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(model_path)
-    tokenizer = vl_chat_processor.tokenizer
+    print(model.model)
+    processor = AutoProcessor.from_pretrained(model_path)
 
-    model: MultiModalityCausalLM = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
     )
-    model_full = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
 
-    model = model.to(torch.bfloat16).cuda().eval()
-    model_full = model_full.to(torch.bfloat16).cuda().eval()
+    generated_ids = model.generate(**inputs, max_new_tokens=128)
+
+    # generated_ids_trimmed = [
+    #     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    # ]
+    # base_answers = processor.batch_decode(
+    #     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    # )
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    base_answers = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
 
     import torch, clip, PIL.Image as Image
     clip_model, clip_preprocess = clip.load('ViT-B/32')
 
-
-    conversation = [
-        {
-            "role": "User",
-            "content": "<image_placeholder>\nConvert the formula into latex code.",
-            "images": ["/mnt/temp/hshi/EvoPress/EvoPress/generated_samples/img_0.jpg"],
-        },
-        {"role": "Assistant", "content": ""},
-    ]
-
-    pil_images = load_pil_images(conversation)
-    prepare_inputs = vl_chat_processor(
-        conversations=conversation, images=pil_images, force_batchify=True
-    ).to(model.device)
-
-    inputs_embeds = model.prepare_inputs_embeds(**prepare_inputs)
-
-        # # run the model to get the response
-    base_answers = model.language_model.generate(
-        inputs_embeds=inputs_embeds,
-        attention_mask=prepare_inputs.attention_mask,
-        pad_token_id=tokenizer.eos_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        max_new_tokens=512,
-        do_sample=False,
-        use_cache=False,
-    )
-
-    base_answers = tokenizer.decode(base_answers[0].cpu().tolist(), skip_special_tokens=True)
-    # print(f"{prepare_inputs['sft_format'][0]}", answer)
-
-
-    layers = get_layers(model.language_model.model)
+    layers = get_layers(model)
+    blocks = get_layers_vit(model)
     
-    blocks_to_remove = int(args.sparsity * len(layers))
+    blocks_to_remove = int(args.sparsity * (len(layers) + len(blocks)))
     print(f"Removing {blocks_to_remove} blocks")
-    total_blocks = len(layers)
+
+    total_blocks = len(layers) + len(blocks)
 
     calibration_data = torch.load(f"/mnt/temp/hshi/EvoPress/EvoPress/generated_tokens.pt")
 
@@ -571,8 +517,13 @@ def main():
         blocks_to_remove = blocks_to_remove // 2
 
     for layer in layers:
-        dummy_initialize(getattr(layer, get_attn_layer_name(model.language_model.model)))
-        dummy_initialize(getattr(layer, get_mlp_layer_name(model.language_model.model)))
+        dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
+        dummy_initialize(getattr(layer, get_mlp_layer_name(model.model.language_model)))
+
+    for block in blocks:
+        dummy_initialize(getattr(block, get_attn_layer_name_vit(model)))
+        dummy_initialize(getattr(block, get_mlp_layer_name_vit(model)))
+
 
     legal_mask = get_legal_mask(
         args.legal_to_drop_path, total_blocks
@@ -607,13 +558,13 @@ def main():
 
     population, train_fitnesses = selection(
         model=model,
-        model_full=model_full,
+        model_full=model,
+        processor=processor,
         clip_model=clip_model,
         clip_preprocess=clip_preprocess,
         layers=layers,
         candidates=initial_population_candidates,
-        prompt=prepare_inputs,
-        tokenizer=tokenizer,
+        prompt=inputs,
         base_answer=base_answers,
         num_survive=args.population_size,
         calibration_data=calibration_data,
@@ -623,8 +574,6 @@ def main():
         fitness_fn=args.fitness_fn,
     )
 
-
-
     for gen_id in range(args.generations):
         print(f"Generation {gen_id + 1}/{args.generations}")
         print(f"Train fitness {train_fitnesses[0]}")
@@ -632,7 +581,7 @@ def main():
         for parent in population:
             print(f"Parent: attn: {[int(ele) for ele in parent['attn']]} mlp: {[int(ele) for ele in parent['mlp']]}")
 
-        load_states(model, layers, population[0], args.drop_two_consecutive)
+        load_states(model, layers, blocks, population[0])
 
         # Evaluate current search point
         # if gen_id % args.eval_every == 0 and not args.no_eval:
@@ -691,13 +640,13 @@ def main():
 
             offspring_list, train_fitnesses = selection(
                 model=model,
-                model_full=model_full,
+                model_full=model,
+                processor=processor,
                 clip_model=clip_model,
                 clip_preprocess=clip_preprocess,
                 layers=layers,
                 candidates=offspring_list,
-                prompt=prepare_inputs,
-                tokenizer=tokenizer,
+                prompt=copy.deepcopy(inputs),
                 base_answer=base_answers,
                 num_survive=num_survive,
                 calibration_data=calibration_data,
@@ -712,29 +661,26 @@ def main():
         layer_drop_config = get_layer_drop_config(population[0])
         if args.drop_config_dir:
             os.makedirs(args.drop_config_dir, exist_ok=True)
-            with open(os.path.join(args.drop_config_dir, "layer_drop_config_inference_40.txt"), "w") as f:
+            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_20.txt"), "w") as f:
                 for line in layer_drop_config:
                     f.write(line + "\n")
 
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
         # Save model
-        torch.save(model.language_model.model, os.path.join(args.save_dir, "final_model.pth"))
+        torch.save(model, os.path.join(args.save_dir, "final_model.pth"))
         save_dir1 = os.path.join(args.save_dir, "modified_janus")
         model.save_pretrained(save_dir1)
         print("模型已保存至:", save_dir1)
 
         # Save layer drop config
-        with open(os.path.join(args.save_dir, "layer_drop_config_inference_40.txt"), "w") as f:
+        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_20.txt"), "w") as f:
             for line in layer_drop_config:
                 f.write(line + "\n")
 
     print("Final configuration:")
     for line in layer_drop_config:
         print(line)
-
-    # ppl_eval = compute_clip(model, model_full, clip_model, clip_preprocess, prompt)
-    # full_train_ppl = compute_clip(model, model_full, clip_model, clip_preprocess, prompt)
 
 if __name__ == "__main__":
     main()
