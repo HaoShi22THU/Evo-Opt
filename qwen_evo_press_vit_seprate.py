@@ -570,36 +570,88 @@ def main():
         while len(offspring_list) < args.offspring:
             offspring = copy.deepcopy(random.choice(population))
 
-            # Mutation
+            offspring_vit = {
+                "attn": copy.deepcopy(offspring["attn"][len(layers):]),
+                "mlp": copy.deepcopy(offspring["mlp"][len(layers):]),
+            }
+            offspring_language = {
+                "attn": copy.deepcopy(offspring["attn"][:len(layers)]),
+                "mlp": copy.deepcopy(offspring["mlp"][:len(layers)]),
+            }
+
             num_flips = min(
                 random.randint(1, args.max_mutations), random.randint(1, args.max_mutations)
             )  # bias towards lower values
             for _ in range(num_flips):
-                remove_type = random.randint(0, 1)  # 0 remove attention, 1 remove mlp
+                remove_type = random.randint(0, 1)
                 if remove_type == 0:
                     subblock_type = "attn"
                 else:
                     subblock_type = "mlp"
 
-                remove_ind = random.randint(0, total_blocks - 1)
-                while offspring[subblock_type][remove_ind]:
-                    remove_ind = random.randint(0, total_blocks - 1)
+                remove_ind_vit = random.randint(0, blocks_to_remove - 1)
+                while offspring_vit[subblock_type][remove_ind]:
+                    remove_ind = random.randint(0, blocks_to_remove - 1)
 
-                add_ind = random.randint(0, total_blocks - 1)
-                while not offspring[subblock_type][add_ind]:
-                    add_ind = random.randint(0, total_blocks - 1)
+                add_ind = random.randint(0, blocks_to_remove - 1)
+                while not offspring_vit[subblock_type][add_ind]:
+                    add_ind = random.randint(0, blocks_to_remove - 1)
 
-                offspring[subblock_type][remove_ind] = True
-                offspring[subblock_type][add_ind] = False
+                offspring_vit[subblock_type][remove_ind] = True
+                offspring_vit[subblock_type][add_ind] = False
+            
+            for _ in range(num_flips):
+                remove_type = random.randint(0, 1)
+                if remove_type == 0:
+                    subblock_type = "attn"
+                else:
+                    subblock_type = "mlp"
+                
+                remove_ind_language = random.randint(0, layers_to_remove - 1)
+                while offspring_language[subblock_type][remove_ind_language]:
+                    remove_ind_language = random.randint(0, layers_to_remove - 1)
+                add_ind_language = random.randint(0, layers_to_remove - 1)
+                while not offspring_language[subblock_type][add_ind_language]:
+                    add_ind_language = random.randint(0, layers_to_remove - 1)
+                offspring_language[subblock_type][remove_ind_language] = True
 
-            if args.drop_entire_block:
-                offspring["mlp"] = copy.deepcopy(offspring["attn"])
+            # 合并两个字典
+            offspring = {
+                "attn": offspring_language["attn"] + offspring_vit["attn"],
+                "mlp": offspring_language["mlp"] + offspring_vit["mlp"],
+            }
+
+
+            # # Mutation
+            # num_flips = min(
+            #     random.randint(1, args.max_mutations), random.randint(1, args.max_mutations)
+            # )  # bias towards lower values
+            # for _ in range(num_flips):
+            #     remove_type = random.randint(0, 1)  # 0 remove attention, 1 remove mlp
+            #     if remove_type == 0:
+            #         subblock_type = "attn"
+            #     else:
+            #         subblock_type = "mlp"
+
+            #     remove_ind = random.randint(0, total_blocks - 1)
+            #     while offspring[subblock_type][remove_ind]:
+            #         remove_ind = random.randint(0, total_blocks - 1)
+
+            #     add_ind = random.randint(0, total_blocks - 1)
+            #     while not offspring[subblock_type][add_ind]:
+            #         add_ind = random.randint(0, total_blocks - 1)
+
+            #     offspring[subblock_type][remove_ind] = True
+            #     offspring[subblock_type][add_ind] = False
+
+            # if args.drop_entire_block:
+            #     offspring["mlp"] = copy.deepcopy(offspring["attn"])
 
             if offspring in offspring_list or offspring in population:  # avoid duplicates
                 continue
 
-            if not is_valid_state(offspring, legal_mask):
-                continue
+            # if not is_valid_state(offspring, legal_mask):
+            #     continue
 
             if offspring["attn"][0] != False or offspring["attn"][28] != False:
                 # print("Error: first block cannot be removed")
