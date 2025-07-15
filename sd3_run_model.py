@@ -539,7 +539,7 @@ def main():
         model_dir, torch_dtype=torch.float16
     ).to("cuda")
 
-    with open ("/mnt/temp/hshi/EvoPress/EvoPress/timestep_drop_config_70.txt", "r") as f:
+    with open ("/mnt/temp/hshi/EvoPress/EvoPress/timestep_drop_config_70_noclip.txt", "r") as f:
         lines = f.readlines()
     # 读取每一行的内容
 
@@ -558,7 +558,7 @@ def main():
     patch_sd3_reuse_attn(pipe_fast, reuse_steps=reuse_steps)
 
     # prompt = "A close-up high-contrast photo of Sydney Opera House sitting next to Eiffel tower, under a blue night sky of roiling energy, exploding yellow stars, and radiating swirls of blue."
-    prompt = "Expressionist painting of a bustling citystreet at night, lights glowing with vibrant colorsreflecting off wet pavement."
+    prompt = "lsometric voxel art of a gamer's room withRGB-lit computer setup, posters on the wall, acharacter gaming in a chair, and a cat sitting on the desk by the keyboard."
     # ---------- 5.3 baseline 时间 ----------
     torch.cuda.synchronize()
     t0 = time.time()

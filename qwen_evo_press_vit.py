@@ -1,6 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import argparse
 import random
@@ -25,40 +25,40 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 import types
 from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
 
-def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
-    """
-    A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
-    shape‑mismatch error when attention_mask contains vision tokens.
-    """
-    # When no mask is given, fall back to a simple arange.
-    if attention_mask is None:
-        seq_len = input_ids.size(1)
-        position_ids = torch.arange(
-            seq_len, dtype=torch.long, device=input_ids.device
-        ).unsqueeze(0).expand(input_ids.size(0), -1)
-        return position_ids, None
+# def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
+#     """
+#     A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
+#     shape‑mismatch error when attention_mask contains vision tokens.
+#     """
+#     # When no mask is given, fall back to a simple arange.
+#     if attention_mask is None:
+#         seq_len = input_ids.size(1)
+#         position_ids = torch.arange(
+#             seq_len, dtype=torch.long, device=input_ids.device
+#         ).unsqueeze(0).expand(input_ids.size(0), -1)
+#         return position_ids, None
 
-    # Build position_ids sample‑by‑sample.
-    pos_list = []
-    for i in range(input_ids.size(0)):       # iterate over batch
-        text_mask = attention_mask[i] == 1   # keep only text tokens
-        pos = torch.arange(
-            text_mask.sum(),
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        pos_list.append(pos)
+#     # Build position_ids sample‑by‑sample.
+#     pos_list = []
+#     for i in range(input_ids.size(0)):       # iterate over batch
+#         text_mask = attention_mask[i] == 1   # keep only text tokens
+#         pos = torch.arange(
+#             text_mask.sum(),
+#             dtype=torch.long,
+#             device=input_ids.device,
+#         )
+#         pos_list.append(pos)
 
-    # Pad to the longest sequence in the batch.
-    position_ids = torch.nn.utils.rnn.pad_sequence(
-        pos_list, batch_first=True, padding_value=0
-    )
-    return position_ids, None  # rope_deltas is unchanged
+#     # Pad to the longest sequence in the batch.
+#     position_ids = torch.nn.utils.rnn.pad_sequence(
+#         pos_list, batch_first=True, padding_value=0
+#     )
+#     return position_ids, None  # rope_deltas is unchanged
 
-# Monkey‑patch the model class
-qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
-    _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
-)
+# # Monkey‑patch the model class
+# qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
+#     _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
+# )
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import  AutoProcessor, AutoConfig
@@ -146,8 +146,6 @@ def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prom
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
 
-    
-
     def safe_tokenize(texts, max_length=76):
         flat = []
         for t in texts:
@@ -174,7 +172,6 @@ def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prom
    
     return similarity
     # return -1
-
 
 def get_layer_drop_config(removed_state) -> List[str]:
     # 获取removed_state中attn的长度
@@ -237,7 +234,6 @@ def is_valid_state(removed_state, legal_to_drop):
                 return False
     # 如果所有子块都符合条件，则返回True
     return True
-
 
 def load_states(model, layers, blocks,removed_state):
     # 深度拷贝removed_state
@@ -317,7 +313,6 @@ def selection(
     best_ids = np.argsort(fitnesses)[:num_survive]
     return [candidates[i] for i in best_ids], [fitnesses[i] for i in best_ids]
 
-
 def parse_args():
     parser = argparse.ArgumentParser()
     # Model params
@@ -356,12 +351,12 @@ def parse_args():
     parser.add_argument("--eval_tokens", default=524288, type=int, help="Number of tokens for evaluation.")
     parser.add_argument("--eval_sequence_length", default=None, type=int, help="Length of evaluation sequences.")
     # Sparsification params
-    parser.add_argument("--sparsity", type=float, default=0.20, help="Fraction of layers to drop.")
+    parser.add_argument("--sparsity", type=float, default=0.35, help="Fraction of layers to drop.")
     # Logging params
     parser.add_argument("--log_wandb", default=False, action="store_true", help="Whether to log to W&B")
     # Evolutionary Search paramsss
     parser.add_argument("--fitness_fn", choices=["ppl", "kl"], default="ppl", help="Fitness function.")
-    parser.add_argument("--generations", default=150, help="Number of generations in evolutionary search")
+    parser.add_argument("--generations", default=50, help="Number of generations in evolutionary search")
     parser.add_argument("--offspring", type=int, default=64, help="Number of offspring generated in each generation")
     parser.add_argument("--population_size", type=int, default=4, help="Population size in evolutionary search")
     parser.add_argument(
@@ -426,11 +421,10 @@ def parse_args():
     parser.add_argument("--seed", default=0, type=int, help="Random seed.")
     # Save params
     parser.add_argument("--save_dir", type=str, default="/mnt/temp/hshi/EvoPress/EvoPress", help="Where to save sparse model.")
-    parser.add_argument("--drop_config_dir", type=str, help="Where to save layer drop config.")
+    parser.add_argument("--drop_config_dir", type=str, default="/mnt/temp/hshi/EvoPress/EvoPress", help="Where to save layer drop config.")
 
     args = parser.parse_args()
     return args
-
 
 def main():
     args = parse_args()
@@ -554,6 +548,10 @@ def main():
         if not is_valid_state(removed_state, legal_mask):
             continue
 
+        if removed_state["attn"][0] != False or removed_state["attn"][28] != False:
+            # print("Error: first block cannot be removed")
+            continue
+
         initial_population_candidates.append(removed_state)
 
     population, train_fitnesses = selection(
@@ -581,7 +579,7 @@ def main():
         for parent in population:
             print(f"Parent: attn: {[int(ele) for ele in parent['attn']]} mlp: {[int(ele) for ele in parent['mlp']]}")
 
-        load_states(model, layers, blocks, population[0])
+        # load_states(model, layers, blocks, population[0])
 
         # Evaluate current search point
         # if gen_id % args.eval_every == 0 and not args.no_eval:
@@ -627,6 +625,11 @@ def main():
             if not is_valid_state(offspring, legal_mask):
                 continue
 
+            if offspring["attn"][0] != False or offspring["attn"][28] != False:
+                # print("Error: first block cannot be removed")
+                continue
+
+
             offspring_list.append(offspring)
 
         # Selection in multiple steps
@@ -661,20 +664,20 @@ def main():
         layer_drop_config = get_layer_drop_config(population[0])
         if args.drop_config_dir:
             os.makedirs(args.drop_config_dir, exist_ok=True)
-            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_20.txt"), "w") as f:
+            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_35_1.txt"), "w") as f:
                 for line in layer_drop_config:
                     f.write(line + "\n")
 
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
         # Save model
-        torch.save(model, os.path.join(args.save_dir, "final_model.pth"))
-        save_dir1 = os.path.join(args.save_dir, "modified_janus")
-        model.save_pretrained(save_dir1)
-        print("模型已保存至:", save_dir1)
+        # torch.save(model, os.path.join(args.save_dir, "final_model.pth"))
+        # save_dir1 = os.path.join(args.save_dir, "modified_janus")
+        # model.save_pretrained(save_dir1)
+        # print("模型已保存至:", save_dir1)
 
         # Save layer drop config
-        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_20.txt"), "w") as f:
+        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_35_1.txt"), "w") as f:
             for line in layer_drop_config:
                 f.write(line + "\n")
 
@@ -684,12 +687,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-    

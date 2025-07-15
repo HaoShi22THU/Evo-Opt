@@ -156,7 +156,7 @@ def compute_clip(model, model_full, clip_model, clip_preprocess, prompt):
     store_tokens[:,:, :50] = inputs_embeds.permute(0, 2, 1)
 
     for i in range(image_token_num_per_image):
-        if i <= image_token_num_per_image // 2:
+        if i == 0:
             outputs = model_full.language_model.model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=outputs.past_key_values if i != 0 else None)
             hidden_states = outputs.last_hidden_state
             
@@ -312,9 +312,9 @@ def load_states(model, layers, removed_state, drop_two_consecutive):
     # 深度拷贝removed_state
     removed_state = copy.deepcopy(removed_state)
     # 如果drop_two_consecutive为True，则将removed_state中的attn和mlp列表中的每个元素都复制一遍
-    if drop_two_consecutive:  # decompress: duplicate every entry
-        removed_state["attn"] = [removed_state["attn"][i // 2] for i in range(2 * len(removed_state["attn"]))]
-        removed_state["mlp"] = [removed_state["mlp"][i // 2] for i in range(2 * len(removed_state["mlp"]))]
+    # if drop_two_consecutive:  # decompress: duplicate every entry
+    #     removed_state["attn"] = [removed_state["attn"][i // 2] for i in range(2 * len(removed_state["attn"]))]
+    #     removed_state["mlp"] = [removed_state["mlp"][i // 2] for i in range(2 * len(removed_state["mlp"]))]
 
     # 遍历removed_state中的attn和mlp列表
     for subblock_type in ["attn", "mlp"]:

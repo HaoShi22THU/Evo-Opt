@@ -200,9 +200,6 @@ def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
     """
     assert layer_type in ["attn+mlp", "attn", "mlp"]
 
-    # ——————————————————————————————————————————
-    # 1. 整块裁掉：仍需返回三元组
-    # ——————————————————————————————————————————
     if layer_type == "attn+mlp":
 
         def dummy_forward(
@@ -237,9 +234,6 @@ def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
             # 3) Always return the standard triple expected by Transformer blocks
             return output, None, present
 
-    # ——————————————————————————————————————————
-    # 2. 仅裁掉注意力：需要占位 KV
-    # ——————————————————————————————————————————
     elif layer_type == "attn":
 
         def dummy_forward(
@@ -257,9 +251,6 @@ def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
 
             # 2) Handle KV‑Cache when requested
             if use_cache:
-                # If this is *not* the first forward pass, `past_key_value`
-                # is already a Cache object. We simply update it with 0‑len
-                # tensors so the sequence length stays consistent.
                 if past_key_value is not None and hasattr(past_key_value, "update"):
                     bsz, _, hidden_dim = hidden_states.shape
                     head_dim = getattr(self, "head_dim", hidden_dim // getattr(self, "num_heads", 1))
@@ -274,9 +265,6 @@ def make_dummy_forward(module: nn.Module, layer_type: str = "attn+mlp") -> None:
             # 3) Always return the standard triple expected by Transformer blocks
             return 0, None, present
 
-    # ——————————————————————————————————————————
-    # 3. 仅裁掉 MLP：保留 attn，返回 hidden_states
-    # ——————————————————————————————————————————
     elif layer_type == "mlp":
 
         def dummy_forward(self, hidden_states: torch.Tensor, *args, **kwargs):

@@ -483,7 +483,7 @@ def parse_args():
     parser.add_argument("--eval_tokens", default=524288, type=int, help="Number of tokens for evaluation.")
     parser.add_argument("--eval_sequence_length", default=None, type=int, help="Length of evaluation sequences.")
     # Sparsification params
-    parser.add_argument("--sparsity", type=float, default=0.7, help="Fraction of layers to drop.")
+    parser.add_argument("--sparsity", type=float, default=0.6, help="Fraction of layers to drop.")
     # Logging params
     parser.add_argument("--log_wandb", default=False, action="store_true", help="Whether to log to W&B")
     # Evolutionary Search paramsss
@@ -738,11 +738,11 @@ def main():
 
         if args.drop_config_dir:
             os.makedirs(args.drop_config_dir, exist_ok=True)
-            with open(os.path.join(args.drop_config_dir, f"timestep_drop_config_70_noclip.txt"), "w") as f:
+            with open(os.path.join(args.drop_config_dir, f"timestep_drop_config_60_noclip.txt"), "w") as f:
                 for line in layer_drop_config:
                     f.write(line + "\n")    
     if args.save_dir:
-        with open(os.path.join(args.save_dir, f"timestep_drop_config_70_noclip.txt"), "w") as f:
+        with open(os.path.join(args.save_dir, f"timestep_drop_config_60_noclip.txt"), "w") as f:
             for line in layer_drop_config:
                 f.write(line + "\n")
     

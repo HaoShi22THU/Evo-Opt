@@ -3,50 +3,14 @@ if getattr(modeling_utils, "ALL_PARALLEL_STYLES", None) is None:
     # 只需填一个非空可迭代对象即可；这里给出官方目前支持的 4 种并行风格
     modeling_utils.ALL_PARALLEL_STYLES = {"tp", "none", "colwise", "rowwise"}
 
-import types
-from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
-#     """
-#     A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
-#     shape‑mismatch error when attention_mask contains vision tokens.
-#     """
-#     # When no mask is given, fall back to a simple arange.
-#     if attention_mask is None:
-#         seq_len = input_ids.size(1)
-#         position_ids = torch.arange(
-#             seq_len, dtype=torch.long, device=input_ids.device
-#         ).unsqueeze(0).expand(input_ids.size(0), -1)
-#         return position_ids, None
-
-#     # Build position_ids sample‑by‑sample.
-#     pos_list = []
-#     for i in range(input_ids.size(0)):       # iterate over batch
-#         text_mask = attention_mask[i] == 1   # keep only text tokens
-#         pos = torch.arange(
-#             text_mask.sum(),
-#             dtype=torch.long,
-#             device=input_ids.device,
-#         )
-#         pos_list.append(pos)
-
-#     # Pad to the longest sequence in the batch.
-#     position_ids = torch.nn.utils.rnn.pad_sequence(
-#         pos_list, batch_first=True, padding_value=0
-#     )
-#     return position_ids, None  # rope_deltas is unchanged
-
-# # Monkey‑patch the model class
-# qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
-#     _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
-# )
 
 
 import torch
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import numpy as np
 
@@ -62,8 +26,14 @@ from src.model_utils import (
     restore_forward,
 )
 
+from src.model_utils import (
+    get_layers_vit,
+    get_attn_layer_name_vit,
+    get_mlp_layer_name_vit,
+)
+
 def load_drop_config():
-    with open("/mnt/temp/hshi/EvoPress/EvoPress/qwen_layer_skip_config_inference_30_L.txt", "r") as f:
+    with open("/mnt/temp/hshi/EvoPress/EvoPress/qwen_layer_skip_config_inference_30_1.txt", "r") as f:
         lines = f.readlines()
     # 读取每一行的内容
     removed_state = {"attn": [False] * len(lines), "mlp": [False] * len(lines)}
@@ -92,25 +62,33 @@ def load_drop_config():
 
 
 @torch.no_grad()
-def load_states(model, layers, removed_state):
+def load_states(model, layers, blocks, removed_state):
     # 深度拷贝removed_state
     removed_state = copy.deepcopy(removed_state)
-    # 如果drop_two_consecutive为True，则将removed_state中的attn和mlp列表中的每个元素都复制一遍
-    # if drop_two_consecutive:  # decompress: duplicate every entry
-    #     removed_state["attn"] = [removed_state["attn"][i // 2] for i in range(2 * len(removed_state["attn"]))]
-    #     removed_state["mlp"] = [removed_state["mlp"][i // 2] for i in range(2 * len(removed_state["mlp"]))]
 
     # 遍历removed_state中的attn和mlp列表
     for subblock_type in ["attn", "mlp"]:
-        for j in range(len(removed_state[subblock_type])):
+        for j in range(len(layers)):
             # 根据subblock_type获取对应的subblock
-            # print("subblock_type:", subblock_type)
             if subblock_type == "attn":
-                subblock = getattr(layers[j], get_attn_layer_name(model.model.language_model))
+                subblock = getattr(layers[j], get_attn_layer_name(model.model))
             else:
-                subblock = getattr(layers[j], get_mlp_layer_name(model.model.language_model))
+                subblock = getattr(layers[j], get_mlp_layer_name(model.model))
             # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
             if removed_state[subblock_type][j]:
+                make_dummy_forward(subblock, subblock_type)
+            # 否则，将subblock恢复为正常的forward
+            else:
+                restore_forward(subblock)
+    
+    for subblock_type in ["attn", "mlp"]:
+        for j in range(len(blocks)):
+            if subblock_type == "attn":
+                subblock = getattr(blocks[j], get_attn_layer_name_vit(model.model))
+            else:
+                subblock = getattr(blocks[j], get_mlp_layer_name_vit(model.model))
+            # 如果removed_state[subblock_type][j]为True，则将subblock设置为dummy_forward
+            if removed_state[subblock_type][j+len(layers)]:
                 make_dummy_forward(subblock, subblock_type)
             # 否则，将subblock恢复为正常的forward
             else:
@@ -144,7 +122,8 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                # "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                "image": "/mnt/temp/hshi/EvoPress/EvoPress/generated_samples/demo1.png",
             },
             {"type": "text", "text": "Describe this image."},
         ],
@@ -153,22 +132,30 @@ messages = [
 
 
 layers = get_layers(model)
+blocks = get_layers_vit(model)
+
 print(f"Number of layers: {len(layers)}")
+print(f"Number of blocks: {len(blocks)}")
 
 for layer in layers:
     dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
     dummy_initialize(getattr(layer, get_mlp_layer_name(model.model.language_model)))
+    
+for block in blocks:
+    dummy_initialize(getattr(block, get_attn_layer_name_vit(model)))
+    dummy_initialize(getattr(block, get_mlp_layer_name_vit(model)))
+
 
 # 读取配置文件
 drop_config = load_drop_config()
 
-load_states(model, layers, drop_config)
-
+load_states(model, layers, blocks, drop_config)
 
 # Preparation for inference
 text = processor.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
 )
+
 image_inputs, video_inputs = process_vision_info(messages)
 inputs = processor(
     text=[text],
@@ -177,6 +164,7 @@ inputs = processor(
     padding=True,
     return_tensors="pt",
 )
+
 inputs = inputs.to("cuda")
 
 # Inference: Generation of the output
@@ -184,6 +172,27 @@ inputs = inputs.to("cuda")
 generated_ids = model.generate(**inputs, max_new_tokens=128, use_cache=True)
 
 
+with torch.no_grad():
+    prompt_len = inputs.input_ids.shape[1]
+
+    seq_ids   = generated_ids                          # prompt + 新文本
+    seq_attn  = torch.ones_like(seq_ids)               # 全 1 mask
+    labels    = seq_ids.clone()
+    labels[:, :prompt_len] = -100                      # 只评估生成段
+
+    # 1) 复制一份原 inputs
+    lm_inputs = {k: v for k, v in inputs.items()}
+    # 2) 替换文本相关字段
+    lm_inputs.update({
+        "input_ids":      seq_ids,
+        "attention_mask": seq_attn,
+        "labels":         labels,
+    })
+
+    out  = model(**lm_inputs, use_cache=False, return_dict=True)
+    ppl  = torch.exp(out.loss).item()
+
+print(f"PPL on generated text: {ppl:.3f}")
 generated_ids_trimmed = [
     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
 ]
