@@ -1,6 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import argparse
 import random
@@ -25,41 +25,6 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 import types
 from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_vl
 
-# def _fixed_get_rope_index(self, input_ids, attention_mask, *args, **kwargs):
-#     """
-#     A drop‑in replacement for Qwen2_5_VLModel.get_rope_index that avoids the
-#     shape‑mismatch error when attention_mask contains vision tokens.
-#     """
-#     # When no mask is given, fall back to a simple arange.
-#     if attention_mask is None:
-#         seq_len = input_ids.size(1)
-#         position_ids = torch.arange(
-#             seq_len, dtype=torch.long, device=input_ids.device
-#         ).unsqueeze(0).expand(input_ids.size(0), -1)
-#         return position_ids, None
-
-#     # Build position_ids sample‑by‑sample.
-#     pos_list = []
-#     for i in range(input_ids.size(0)):       # iterate over batch
-#         text_mask = attention_mask[i] == 1   # keep only text tokens
-#         pos = torch.arange(
-#             text_mask.sum(),
-#             dtype=torch.long,
-#             device=input_ids.device,
-#         )
-#         pos_list.append(pos)
-
-#     # Pad to the longest sequence in the batch.
-#     position_ids = torch.nn.utils.rnn.pad_sequence(
-#         pos_list, batch_first=True, padding_value=0
-#     )
-#     return position_ids, None  # rope_deltas is unchanged
-
-# # Monkey‑patch the model class
-# qwen_vl.Qwen2_5_VLModel.get_rope_index = types.MethodType(
-#     _fixed_get_rope_index, qwen_vl.Qwen2_5_VLModel
-# )
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import  AutoProcessor, AutoConfig
 from qwen_vl_utils import process_vision_info
@@ -81,8 +46,6 @@ from src.model_utils import (
     get_attn_layer_name_vit,
     get_mlp_layer_name_vit,
 )
-# from src.metrics import compute_perplexity, compute_kl_div
-
 
 ### Janus Pro
 import torch
@@ -97,13 +60,6 @@ import PIL.Image
 @torch.no_grad()
 def compute_clip(model, model_full, processor, clip_model, clip_preprocess, prompt, base_answer):
     device = next(model.parameters()).device
-
-    # model_path = "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct"
-
-    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True)
-
-    # # print(model.model)
-    # processor = AutoProcessor.from_pretrained(model_path)
 
     messages = [
         {
@@ -353,6 +309,10 @@ def parse_args():
     # Sparsification params
     parser.add_argument("--sparsity", type=float, default=0.40, help="Fraction of layers to drop.")
     # Logging params
+
+    parser.add_argument("--Vit_sparsity", type=float, default=0.40, help="Fraction of blocks to drop in ViT (32 layers).")
+    parser.add_argument("--Language_sparsity", type=float, default=0.40, help="Fraction of layers to drop in Language model (28 layers).")
+
     parser.add_argument("--log_wandb", default=False, action="store_true", help="Whether to log to W&B")
     # Evolutionary Search paramsss
     parser.add_argument("--fitness_fn", choices=["ppl", "kl"], default="ppl", help="Fitness function.")
@@ -495,20 +455,20 @@ def main():
 
     layers = get_layers(model)
     blocks = get_layers_vit(model)
-    
-    blocks_to_remove = int(args.sparsity * (len(layers) + len(blocks)))
+
+    layers_to_remove = int(args.Language_sparsity * len(layers))
+    print(f"Removing {layers_to_remove} layers")
+    blocks_to_remove = int(args.Vit_sparsity * len(blocks))
     print(f"Removing {blocks_to_remove} blocks")
+    
+    # blocks_to_remove = int(args.sparsity * (len(layers) + len(blocks)))
+    # print(f"Removing {blocks_to_remove} blocks")
 
     total_blocks = len(layers) + len(blocks)
 
     calibration_data = torch.load(f"/mnt/temp/hshi/EvoPress/EvoPress/generated_tokens.pt")
 
     eval_datasets = torch.load(f"/mnt/temp/hshi/EvoPress/EvoPress/generated_tokens.pt")
-
-    if args.drop_two_consecutive:
-        assert total_blocks % 2 == 0 and blocks_to_remove % 2 == 0, "Number of total and removed blocks must be even"
-        total_blocks = total_blocks // 2  # view two consecutive blocks as one block
-        blocks_to_remove = blocks_to_remove // 2
 
     for layer in layers:
         dummy_initialize(getattr(layer, get_attn_layer_name(model.model.language_model)))
@@ -518,9 +478,12 @@ def main():
         dummy_initialize(getattr(block, get_attn_layer_name_vit(model)))
         dummy_initialize(getattr(block, get_mlp_layer_name_vit(model)))
 
+    legal_mask_vit = get_legal_mask(
+        args.legal_to_drop_path, blocks_to_remove
+    )  # mask of blocks that can be dropped (all blocks by default)
 
-    legal_mask = get_legal_mask(
-        args.legal_to_drop_path, total_blocks
+    legal_mask_language = get_legal_mask(
+        args.legal_to_drop_path, layers_to_remove
     )  # mask of blocks that can be dropped (all blocks by default)
 
     initial_population_candidates = (
@@ -528,24 +491,37 @@ def main():
     )  # store initially generated search points (only take fittest for first population)
 
     while len(initial_population_candidates) < args.initially_generated:
-        removed_state = {"attn": [False] * total_blocks, "mlp": [False] * total_blocks}
+        removed_state_vit = {"attn": [False] * blocks_to_remove, "mlp": [False] * blocks_to_remove}
+        removed_state_language = {"attn": [False] * layers_to_remove, "mlp": [False] * layers_to_remove}
 
-        attn_legal_ind = [i for i in range(total_blocks) if legal_mask["attn"][i]]
-        attn_remove_ind = random.sample(attn_legal_ind, blocks_to_remove)
-        for ind in attn_remove_ind:
-            removed_state["attn"][ind] = True
+        attn_legal_ind_vit = [i for i in range(blocks_to_remove) if legal_mask_vit["attn"][i]]
+        attn_remove_ind_vit = random.sample(attn_legal_ind_vit, blocks_to_remove)
+        for ind in attn_remove_ind_vit:
+            removed_state_vit["attn"][ind] = True
 
-        mlp_legal_ind = [i for i in range(total_blocks) if legal_mask["mlp"][i]]
+        mlp_legal_ind = [i for i in range(blocks_to_remove) if legal_mask_vit["mlp"][i]]
         mlp_remove_ind = random.sample(mlp_legal_ind, blocks_to_remove)
         for ind in mlp_remove_ind:
-            removed_state["mlp"][ind] = True
+            removed_state_vit["mlp"][ind] = True
 
-        if args.drop_entire_block:
-            removed_state["mlp"] = copy.deepcopy(removed_state["attn"])
+
+        attn_legal_ind_language = [i for i in range(layers_to_remove) if legal_mask_language["attn"][i]]
+        attn_remove_ind_language = random.sample(attn_legal_ind_language, layers_to_remove)
+        for ind in attn_remove_ind_language:
+            removed_state_language["attn"][ind] = True
+        
+        mlp_legal_ind_language = [i for i in range(layers_to_remove) if legal_mask_language["mlp"][i]]
+        mlp_remove_ind_language = random.sample(mlp_legal_ind_language, layers_to_remove)
+        for ind in mlp_remove_ind_language:
+            removed_state_language["mlp"][ind] = True
+    
+        ## 合并两个字典
+        removed_state = {
+            "attn": removed_state_language["attn"] + removed_state_vit["attn"],
+            "mlp": removed_state_language["mlp"] + removed_state_vit["mlp"],
+        }
 
         if removed_state in initial_population_candidates:  # avoid duplicates
-            continue
-        if not is_valid_state(removed_state, legal_mask):
             continue
 
         if removed_state["attn"][0] != False or removed_state["attn"][28] != False:
@@ -664,7 +640,7 @@ def main():
         layer_drop_config = get_layer_drop_config(population[0])
         if args.drop_config_dir:
             os.makedirs(args.drop_config_dir, exist_ok=True)
-            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_40_1.txt"), "w") as f:
+            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_40_1_only.txt"), "w") as f:
                 for line in layer_drop_config:
                     f.write(line + "\n")
 
@@ -677,7 +653,7 @@ def main():
         # print("模型已保存至:", save_dir1)
 
         # Save layer drop config
-        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_40_1.txt"), "w") as f:
+        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_40_1_only.txt"), "w") as f:
             for line in layer_drop_config:
                 f.write(line + "\n")
 
