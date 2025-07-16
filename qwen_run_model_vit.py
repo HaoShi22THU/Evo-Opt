@@ -33,7 +33,7 @@ from src.model_utils import (
 )
 
 def load_drop_config():
-    with open("/mnt/temp/hshi/EvoPress/EvoPress/qwen_layer_skip_config_inference_30_1.txt", "r") as f:
+    with open("/mnt/temp/hshi/EvoPress/EvoPress/qwen_layer_skip_config_inference_40_20_sep.txt", "r") as f:
         lines = f.readlines()
     # 读取每一行的内容
     removed_state = {"attn": [False] * len(lines), "mlp": [False] * len(lines)}
@@ -96,7 +96,7 @@ def load_states(model, layers, blocks, removed_state):
 
 # default: Load the model on the available device(s)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype="auto", device_map="auto", trust_remote_code=True
+    "/mnt/temp/hshi/Qwen2.5-VL-7B-Instruct", torch_dtype="auto", device_map="auto", trust_remote_code=True
 )
 
 # We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
@@ -108,7 +108,7 @@ model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
 # )
 
 # default processer
-processor = AutoProcessor.from_pretrained("/mnt/temp/hshi/Qwen/Qwen2.5-VL-7B-Instruct")
+processor = AutoProcessor.from_pretrained("/mnt/temp/hshi/Qwen2.5-VL-7B-Instruct")
 
 # The default range for the number of visual tokens per image in the model is 4-16384.
 # You can set min_pixels and max_pixels according to your needs, such as a token range of 256-1280, to balance performance and cost.

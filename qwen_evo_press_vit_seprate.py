@@ -311,7 +311,7 @@ def parse_args():
     # Logging params
 
     parser.add_argument("--Vit_sparsity", type=float, default=0.40, help="Fraction of blocks to drop in ViT (32 layers).")
-    parser.add_argument("--Language_sparsity", type=float, default=0.40, help="Fraction of layers to drop in Language model (28 layers).")
+    parser.add_argument("--Language_sparsity", type=float, default=0.20, help="Fraction of layers to drop in Language model (28 layers).")
 
     parser.add_argument("--log_wandb", default=False, action="store_true", help="Whether to log to W&B")
     # Evolutionary Search paramsss
@@ -479,11 +479,11 @@ def main():
         dummy_initialize(getattr(block, get_mlp_layer_name_vit(model)))
 
     legal_mask_vit = get_legal_mask(
-        args.legal_to_drop_path, blocks_to_remove
+        args.legal_to_drop_path, len(blocks)
     )  # mask of blocks that can be dropped (all blocks by default)
 
     legal_mask_language = get_legal_mask(
-        args.legal_to_drop_path, layers_to_remove
+        args.legal_to_drop_path, len(layers)
     )  # mask of blocks that can be dropped (all blocks by default)
 
     initial_population_candidates = (
@@ -491,26 +491,26 @@ def main():
     )  # store initially generated search points (only take fittest for first population)
 
     while len(initial_population_candidates) < args.initially_generated:
-        removed_state_vit = {"attn": [False] * blocks_to_remove, "mlp": [False] * blocks_to_remove}
-        removed_state_language = {"attn": [False] * layers_to_remove, "mlp": [False] * layers_to_remove}
+        removed_state_vit = {"attn": [False] * len(blocks), "mlp": [False] * len(blocks)}
+        removed_state_language = {"attn": [False] * len(layers), "mlp": [False] * len(layers)}
 
-        attn_legal_ind_vit = [i for i in range(blocks_to_remove) if legal_mask_vit["attn"][i]]
+        attn_legal_ind_vit = [i for i in range(len(blocks)) if legal_mask_vit["attn"][i]]
         attn_remove_ind_vit = random.sample(attn_legal_ind_vit, blocks_to_remove)
         for ind in attn_remove_ind_vit:
             removed_state_vit["attn"][ind] = True
 
-        mlp_legal_ind = [i for i in range(blocks_to_remove) if legal_mask_vit["mlp"][i]]
-        mlp_remove_ind = random.sample(mlp_legal_ind, blocks_to_remove)
-        for ind in mlp_remove_ind:
+        mlp_legal_ind_vit = [i for i in range(len(blocks)) if legal_mask_vit["mlp"][i]]
+        mlp_remove_ind_vit = random.sample(mlp_legal_ind_vit, blocks_to_remove)
+        for ind in mlp_remove_ind_vit:
             removed_state_vit["mlp"][ind] = True
 
 
-        attn_legal_ind_language = [i for i in range(layers_to_remove) if legal_mask_language["attn"][i]]
+        attn_legal_ind_language = [i for i in range(len(layers)) if legal_mask_language["attn"][i]]
         attn_remove_ind_language = random.sample(attn_legal_ind_language, layers_to_remove)
         for ind in attn_remove_ind_language:
             removed_state_language["attn"][ind] = True
         
-        mlp_legal_ind_language = [i for i in range(layers_to_remove) if legal_mask_language["mlp"][i]]
+        mlp_legal_ind_language = [i for i in range(len(layers)) if legal_mask_language["mlp"][i]]
         mlp_remove_ind_language = random.sample(mlp_legal_ind_language, layers_to_remove)
         for ind in mlp_remove_ind_language:
             removed_state_language["mlp"][ind] = True
@@ -589,16 +589,16 @@ def main():
                 else:
                     subblock_type = "mlp"
 
-                remove_ind_vit = random.randint(0, blocks_to_remove - 1)
-                while offspring_vit[subblock_type][remove_ind]:
-                    remove_ind = random.randint(0, blocks_to_remove - 1)
+                remove_ind_vit = random.randint(0, len(blocks) - 1)
+                while offspring_vit[subblock_type][remove_ind_vit]:
+                    remove_ind_vit = random.randint(0, len(blocks) - 1)
 
-                add_ind = random.randint(0, blocks_to_remove - 1)
-                while not offspring_vit[subblock_type][add_ind]:
-                    add_ind = random.randint(0, blocks_to_remove - 1)
+                add_ind_vit = random.randint(0, len(blocks) - 1)
+                while not offspring_vit[subblock_type][add_ind_vit]:
+                    add_ind_vit = random.randint(0, len(blocks) - 1)
 
-                offspring_vit[subblock_type][remove_ind] = True
-                offspring_vit[subblock_type][add_ind] = False
+                offspring_vit[subblock_type][remove_ind_vit] = True
+                offspring_vit[subblock_type][add_ind_vit] = False
             
             for _ in range(num_flips):
                 remove_type = random.randint(0, 1)
@@ -607,13 +607,14 @@ def main():
                 else:
                     subblock_type = "mlp"
                 
-                remove_ind_language = random.randint(0, layers_to_remove - 1)
+                remove_ind_language = random.randint(0, len(layers) - 1)
                 while offspring_language[subblock_type][remove_ind_language]:
-                    remove_ind_language = random.randint(0, layers_to_remove - 1)
-                add_ind_language = random.randint(0, layers_to_remove - 1)
+                    remove_ind_language = random.randint(0, len(layers) - 1)
+                add_ind_language = random.randint(0, len(layers) - 1)
                 while not offspring_language[subblock_type][add_ind_language]:
-                    add_ind_language = random.randint(0, layers_to_remove - 1)
+                    add_ind_language = random.randint(0, len(layers) - 1)
                 offspring_language[subblock_type][remove_ind_language] = True
+                offspring_language[subblock_type][add_ind_language] = False
 
             # 合并两个字典
             offspring = {
@@ -692,7 +693,7 @@ def main():
         layer_drop_config = get_layer_drop_config(population[0])
         if args.drop_config_dir:
             os.makedirs(args.drop_config_dir, exist_ok=True)
-            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_40_1_only.txt"), "w") as f:
+            with open(os.path.join(args.drop_config_dir, "qwen_layer_skip_config_inference_40_20_sep.txt"), "w") as f:
                 for line in layer_drop_config:
                     f.write(line + "\n")
 
@@ -705,7 +706,7 @@ def main():
         # print("模型已保存至:", save_dir1)
 
         # Save layer drop config
-        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_40_1_only.txt"), "w") as f:
+        with open(os.path.join(args.save_dir, "qwen_layer_drop_config_inference_40_20_sep.txt"), "w") as f:
             for line in layer_drop_config:
                 f.write(line + "\n")
 
